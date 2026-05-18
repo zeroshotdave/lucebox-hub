@@ -21,7 +21,7 @@ namespace flashprefill {
 // Each arch-specific source owns its block-select launcher to avoid duplicate
 // CUDA host stubs in multi-arch builds.
 
-#ifdef DFLASH27B_HAVE_SM80_FLASHPREFILL
+#if defined(DFLASH27B_HAVE_FLASHPREFILL) || defined(DFLASH27B_HAVE_SM80_FLASHPREFILL)
 extern "C" {
 void launch_compute_mean_vector_bf16(
     const void * K, void * mean_K,
@@ -226,7 +226,7 @@ namespace {
 inline int cdiv(int a, int b) { return (a + b - 1) / b; }
 }
 
-#ifdef DFLASH27B_HAVE_SM80_FLASHPREFILL
+#if defined(DFLASH27B_HAVE_FLASHPREFILL) || defined(DFLASH27B_HAVE_SM80_FLASHPREFILL)
 // ── BF16 (sm_80+) dispatch: native BF16 WMMA kernels ──
 
 int flash_prefill_forward_bf16(
