@@ -1392,6 +1392,9 @@ def _normalize_math(s: str | None) -> str:
     s = s.strip()
     if s.startswith("$") and s.endswith("$"):
         s = s[1:-1].strip()
+    # Strip currency $ (e.g. "$18" → "18")
+    if _re.match(r'^\$\d', s):
+        s = s[1:]
     s = _re.sub(r"\\text\s*\{([^}]*)\}", r"\1", s)
     s = _re.sub(r"\\mathrm\s*\{([^}]*)\}", r"\1", s)
     for cmd in [r"\left", r"\right", r"\displaystyle", r"\tfrac", r"\dfrac"]:
@@ -1451,13 +1454,10 @@ def _math_equiv(pred: str | None, gold: str | None) -> bool:
 
 def _score_math_response(text: str, gold_answer: str) -> tuple[bool, str]:
     """Score a Math500 response. Returns (correct, detail_str)."""
-    # Strip thinking block if present
     think_end = text.rfind("</think>")
     answer_text = text[think_end + len("</think>"):] if think_end >= 0 else text
 
     pred = _extract_boxed(answer_text)
-    if not pred:
-        pred = _extract_boxed(text)
 
     # Fallback: "the answer is **X**" patterns
     if pred is None:
@@ -1484,6 +1484,109 @@ def _score_math_response(text: str, gold_answer: str) -> tuple[bool, str]:
     else:
         detail = f"no answer found, gold={gold_short}"
     return correct, detail
+
+
+def _score_gsm_response(text: str, gold_answer: str) -> tuple[bool, str]:
+    """Score a GSM8K response. Returns (correct, detail_str)."""
+    think_end = text.rfind("</think>")
+    answer_text = text[think_end + len("</think>"):] if think_end >= 0 else text
+
+    pred = None
+
+    # \boxed{<number>}
+    boxed = _extract_boxed(answer_text)
+    if boxed:
+        cleaned = boxed.replace(",", "").replace("$", "").strip()
+        if _re.match(r'^[+-]?\d+\.?\d*$', cleaned):
+            pred = cleaned
+
+    # #### <number>
+    if pred is None:
+        m = _re.search(r'####\s*\$?([+-]?\d[\d,]*\.?\d*)', answer_text)
+        if m:
+            pred = m.group(1).replace(",", "")
+
+    # "the answer is **X**"
+    if pred is None:
+        m = _re.search(
+            r'(?:answer\s+is|result\s+is|equals?|there\s+are|we\s+get)\s*\*?\*?\$?([+-]?\d[\d,]*\.?\d*)',
+            answer_text, _re.IGNORECASE)
+        if m:
+            pred = m.group(1).replace(",", "")
+
+    # **<number>** or **$<number>**
+    if pred is None:
+        m = _re.search(r'\*\*\$?([+-]?\d[\d,]*\.?\d*)\*\*', answer_text)
+        if m:
+            pred = m.group(1).replace(",", "")
+
+    # Last standalone number
+    if pred is None:
+        nums = _re.findall(r'(?<![.\d])([+-]?\d[\d,]*\.?\d*)(?![.\d])', answer_text)
+        if nums:
+            pred = nums[-1].replace(",", "")
+
+    correct = False
+    if pred is not None:
+        try:
+            correct = abs(float(pred) - float(gold_answer)) < 1e-6
+        except (ValueError, TypeError):
+            correct = pred.strip() == gold_answer.strip()
+
+    if correct:
+        detail = f"correct: {pred}"
+    elif pred:
+        detail = f"wrong: pred={pred} gold={gold_answer}"
+    else:
+        detail = f"no answer found, gold={gold_answer}"
+    return correct, detail
+
+
+def _score_he_response(text: str, entry_point: str, gold_test: str) -> tuple[bool, str]:
+    """Score a HumanEval response by executing the generated code against test cases.
+
+    Extracts code from model output, appends the test harness, and runs via subprocess.
+    Returns (correct, detail_str).
+    """
+    import subprocess as _sp
+    import tempfile as _tmp
+
+    think_end = text.rfind("</think>")
+    answer_text = text[think_end + len("</think>"):] if think_end >= 0 else text
+
+    # Extract code block (```python ... ``` or ``` ... ```)
+    code = None
+    m = _re.search(r'```(?:python)?\s*\n(.*?)```', answer_text, _re.DOTALL)
+    if m:
+        code = m.group(1)
+    else:
+        # Try to find the function definition directly
+        m = _re.search(r'((?:from\s|import\s).*?\n)?(\s*def\s+' + _re.escape(entry_point) + r'\b.*)',
+                       answer_text, _re.DOTALL)
+        if m:
+            prefix = m.group(1) or ""
+            code = prefix + m.group(2)
+
+    if not code:
+        return False, "no code extracted"
+
+    # Build test script: function code + test harness + call check(entry_point)
+    test_script = code + "\n" + gold_test + f"\ncheck({entry_point})\n"
+
+    try:
+        result = _sp.run(
+            ["python3", "-c", test_script],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            return True, "correct: tests passed"
+        else:
+            err = result.stderr.strip().split('\n')[-1] if result.stderr else "unknown error"
+            return False, f"wrong: {err[:80]}"
+    except _sp.TimeoutExpired:
+        return False, "wrong: timeout"
+    except Exception as e:
+        return False, f"error: {str(e)[:80]}"
 
 
 # ── bench subcommand ────────────────────────────────────────────────────────
@@ -1648,10 +1751,22 @@ def _run_bench_suite(
             results.append(result)
             continue
 
-        # Math500 correctness scoring
+        # Correctness scoring
         score_detail = ""
-        if suite == "math" and "gold_answer" in case and result.get("text"):
-            correct, detail = _score_math_response(result["text"], case["gold_answer"])
+        if suite == "he" and "gold_test" in case and result.get("text"):
+            correct, detail = _score_he_response(
+                result["text"], case["entry_point"], case["gold_test"])
+            result["correct"] = correct
+            result["score_detail"] = detail
+            n_scored += 1
+            if correct:
+                n_correct += 1
+            score_detail = "OK" if correct else "WRONG"
+        elif "gold_answer" in case and result.get("text"):
+            if suite == "gsm":
+                correct, detail = _score_gsm_response(result["text"], case["gold_answer"])
+            else:
+                correct, detail = _score_math_response(result["text"], case["gold_answer"])
             result["correct"] = correct
             result["score_detail"] = detail
             n_scored += 1
