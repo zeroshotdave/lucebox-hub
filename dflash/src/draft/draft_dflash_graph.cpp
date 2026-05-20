@@ -1,28 +1,29 @@
 // Builds a ggml compute graph for one forward pass of the DFlash draft
-// (5-layer non-causal Qwen3-flavored block-diffusion model).
+// (5-layer Qwen3-flavored block-diffusion model).
 //
 // Stateless: no KV cache. Each call takes:
-//   - noise_embed         [hidden,   q_len, 1]   bf16   (target.tok_embd on [last_tok, MASK*15])
-//   - target_hidden_cat   [5*hidden, ctx_len, 1] bf16   (5 target layers concat along features)
+//   - noise_embed         [hidden,   q_len, 1]   f32    (target.tok_embd on [last_tok, MASK*15])
+//   - target_hidden_cat   [N*hidden, ctx_len, 1] f32    (N target layers concat along features)
 //   - positions_q         [q_len]                i32    values [ctx_len..ctx_len+q_len-1]
 //   - positions_k         [ctx_len+q_len]        i32    values [0..ctx_len+q_len-1]
+//   - causal_mask_swa     [kv_pad, q_len]        f32    (optional; causal mask for SWA layers)
 // and returns:
-//   - hidden_states       [hidden,   q_len, 1]   bf16   (final RMSNorm; NO lm_head here)
+//   - hidden_states       [hidden,   q_len, 1]   f32    (final RMSNorm; NO lm_head here)
 //
 // The caller projects `hidden_states` through the TARGET's lm_head separately
 // (the draft has no lm_head of its own, it shares the target's).
 //
-// Semantics match megaqwen3_27b_dflash/reference/dflash_reference.py exactly:
+// Semantics:
 //   - fc @ target_hidden_cat -> rms_norm with hidden_norm -> target_feat
-//   - Per layer (non-causal):
+//   - Per layer:
 //       h_norm = rms_norm(h) * input_layernorm
 //       Q  = wq  @ h_norm   -> per-head q_norm
 //       K_ctx/V_ctx = wk/wv @ target_feat
 //       K_noi/V_noi = wk/wv @ h_norm
 //       K = concat[K_ctx, K_noi]  -> per-head k_norm
 //       V = concat[V_ctx, V_noi]
-//       RoPE(Q, positions_q); RoPE(K, positions_k)    (NEOX style, theta=10M)
-//       attn = flash_attn_ext(Q, K, V, mask=null, scale=1/sqrt(head_dim))   non-causal
+//       RoPE(Q, positions_q); RoPE(K, positions_k)    (NEOX style)
+//       attn = flash_attn_ext(Q, K, V, mask, scale)   SWA=causal, full=non-causal
 //       h   += wo @ attn
 //       h_norm = rms_norm(h) * post_attention_layernorm
 //       h   += w_down @ (silu(w_gate @ h_norm) * (w_up @ h_norm))
@@ -46,7 +47,7 @@ DraftGraphOutputs build_draft_graph(
     const int n_kv     = w.n_head_kv;
     const int head_dim = w.head_dim;
     const float eps    = DFLASH27B_RMS_EPS;
-    const float rope_base = DFLASH27B_ROPE_THETA;
+    const float rope_base = w.rope_theta;
 
     // ── 1. Feature fusion: target_feat = rms_norm(fc @ target_hidden_cat, hidden_norm)
     //    fc:                [5*hidden, hidden]  (ggml: ne[0]=5*hidden, ne[1]=hidden)
@@ -59,6 +60,12 @@ DraftGraphOutputs build_draft_graph(
 
     // ── 2. Decoder layers
     ggml_tensor * h = in.noise_embed;  // [hidden, q_len, 1]
+
+    // Pre-cast causal mask to F16 (flash_attn_ext requires F16 mask)
+    ggml_tensor * mask_f16 = nullptr;
+    if (in.causal_mask_swa) {
+        mask_f16 = ggml_cast(ctx, in.causal_mask_swa, GGML_TYPE_F16);
+    }
 
     for (int il = 0; il < w.n_layer; il++) {
         const DraftLayer & L = w.layers[il];
@@ -134,9 +141,10 @@ DraftGraphOutputs build_draft_graph(
         V = ggml_permute(ctx, V, 0, 2, 1, 3);  // [head_dim, eff_total_k,  n_kv,   1]
         V = ggml_cont   (ctx, V);
 
-        // ── 2f. Non-causal flash attention; GQA broadcast handled internally.
+        // ── 2f. Attention: causal for SWA layers, non-causal for full layers.
         const float scale = 1.0f / std::sqrt((float)head_dim);
-        ggml_tensor * attn = ggml_flash_attn_ext(ctx, Q, K, V, /*mask=*/nullptr,
+        ggml_tensor * mask = (L.is_swa && mask_f16) ? mask_f16 : nullptr;
+        ggml_tensor * attn = ggml_flash_attn_ext(ctx, Q, K, V, mask,
                                                  scale, /*max_bias=*/0.0f,
                                                  /*logit_softcap=*/0.0f);
         // attn result: [n_embd_v=head_dim, n_head, n_batch=q_len, 1]

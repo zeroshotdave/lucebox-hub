@@ -123,9 +123,13 @@ bool Gemma4DFlashTarget::is_eos(int token) const {
 
 bool Gemma4DFlashTarget::embed_tokens(const int32_t * tokens, int n,
                                        float * out) const {
-    // Return raw embeddings (no sqrt(n_embd) scale) — the draft model
-    // was trained on unscaled embeddings, matching the qwen35 convention.
-    return w_.embedder.embed(tokens, n, out);
+    if (!w_.embedder.embed(tokens, n, out)) return false;
+    // Scale by sqrt(n_embd) to match Gemma4's embedding convention.
+    // The draft was trained with Gemma4's scaled embeddings as noise input.
+    const float scale = std::sqrt((float)w_.n_embd);
+    const size_t total = (size_t)n * w_.n_embd;
+    for (size_t i = 0; i < total; ++i) out[i] *= scale;
+    return true;
 }
 
 bool Gemma4DFlashTarget::project_hidden_to_tokens(

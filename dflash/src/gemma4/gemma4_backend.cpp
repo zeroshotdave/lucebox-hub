@@ -103,9 +103,15 @@ bool Gemma4Backend::init() {
                 // Override n_target_layers from fc shape
                 dw_.n_target_layers = n_capture;
 
+                // Gemma4 DFlash draft: layers 0-3 are SWA (causal), layer 4 is full (non-causal)
+                // (from model card: layer_types = [sliding*4, full_attention])
+                dw_.swa_window = 2048;
+                for (int i = 0; i < dw_.n_layer - 1 && i < (int)dw_.layers.size(); i++)
+                    dw_.layers[i].is_swa = true;
+
                 std::printf("[gemma4] draft loaded: fc_in=%d target_hidden=%d "
-                            "draft_hidden=%d n_capture_layers=%d\n",
-                            fc_in, w_.n_embd, draft_hidden, n_capture);
+                            "draft_hidden=%d n_capture_layers=%d swa=%d\n",
+                            fc_in, w_.n_embd, draft_hidden, n_capture, dw_.swa_window);
 
                 // Allocate target_feat ring buffer
                 constexpr int TARGET_FEAT_CAP = 4096;

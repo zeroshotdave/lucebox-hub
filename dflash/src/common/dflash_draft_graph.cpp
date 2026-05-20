@@ -2,10 +2,25 @@
 #include "draft/draft_graph.h"  // DraftGraphInputs, DraftGraphOutputs, build_draft_graph
 
 #include "ggml-alloc.h"
+#include "ggml-backend.h"
 
+#include <cmath>
 #include <cstdio>
+#include <vector>
 
 namespace dflash::common {
+
+// Minimum alignment required by ggml flash_attn_ext for mask rows.
+static constexpr int MASK_KV_PAD = 32;
+
+static inline int mask_align_up(int x, int a) { return ((x + a - 1) / a) * a; }
+
+// Check whether any layer in the draft is SWA.
+static bool draft_has_swa_layers(const DraftWeights & dw) {
+    for (int i = 0; i < dw.n_layer; i++)
+        if (dw.layers[i].is_swa) return true;
+    return false;
+}
 
 // Build draft graph at a given ctx_len into sg. Does NOT touch sg.alloc.
 // mirror_view: if true, uses a view into mirror->target_feat at slot0.
@@ -56,6 +71,21 @@ static bool build_draft_graph_internal(
     ggml_set_name(sg.positions_k, "positions_k");
     ggml_set_input(sg.positions_k);
 
+    // Causal mask for SWA layers (if any).
+    // Shape: [kv_pad, q_len] F32; padded kv dim to MASK_KV_PAD alignment.
+    sg.attn_mask = nullptr;
+    const bool has_swa = draft_has_swa_layers(dw);
+    if (has_swa) {
+        // SWA layers' effective KV length (windowed or full ctx)
+        const bool swa_active = dw.swa_window > 0 && ctx_len > dw.swa_window;
+        const int eff_ctx = swa_active ? dw.swa_window : ctx_len;
+        const int eff_total_k = eff_ctx + q_len;
+        const int kv_pad = mask_align_up(eff_total_k, MASK_KV_PAD);
+        sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F32, kv_pad, q_len);
+        ggml_set_name(sg.attn_mask, "causal_mask_swa");
+        ggml_set_input(sg.attn_mask);
+    }
+
     sg.gf = ggml_new_graph_custom(sg.ctx, 4096, false);
 
     DraftGraphInputs gi{};
@@ -65,6 +95,7 @@ static bool build_draft_graph_internal(
     gi.positions_q       = sg.positions;
     gi.positions_k       = sg.positions_k;
     gi.lm_head           = lm_head;
+    gi.causal_mask_swa   = sg.attn_mask;
     DraftGraphOutputs go = build_draft_graph(sg.ctx, dw, gi);
     sg.hidden_states = go.hidden_states;
     sg.logits = go.logits;
@@ -125,7 +156,38 @@ bool build_draft_step(
         return false;
     }
 
-    return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
+    if (!ggml_gallocr_alloc_graph(sg.alloc, sg.gf)) {
+        return false;
+    }
+
+    // Fill causal mask data for SWA layers (after allocation gives memory to the tensor).
+    if (sg.attn_mask) {
+        const int q_len = dw.block_size;
+        const bool swa_active = dw.swa_window > 0 && ctx_len > dw.swa_window;
+        const int eff_ctx = swa_active ? dw.swa_window : ctx_len;
+        const int eff_total_k = eff_ctx + q_len;
+        const int kv_pad = mask_align_up(eff_total_k, MASK_KV_PAD);
+
+        // Build causal mask: query at position (eff_ctx + q) can attend to
+        // key at position k if k <= eff_ctx + q.
+        // Context keys (k < eff_ctx): always visible.
+        // Noise keys (k = eff_ctx + j): visible if j <= q.
+        std::vector<float> mask_data((size_t)kv_pad * q_len, -INFINITY);
+        for (int q = 0; q < q_len; q++) {
+            // All context positions are visible
+            for (int k = 0; k < eff_ctx; k++) {
+                mask_data[(size_t)q * kv_pad + k] = 0.0f;
+            }
+            // Noise positions: causal (only positions 0..q visible)
+            for (int j = 0; j <= q; j++) {
+                mask_data[(size_t)q * kv_pad + (eff_ctx + j)] = 0.0f;
+            }
+        }
+        ggml_backend_tensor_set(sg.attn_mask, mask_data.data(), 0,
+                                sizeof(float) * mask_data.size());
+    }
+
+    return true;
 }
 
 }  // namespace dflash::common

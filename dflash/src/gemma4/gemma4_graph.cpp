@@ -751,12 +751,13 @@ bool gemma4_project_hidden(
     ggml_cgraph * gf = ggml_new_graph(ctx);
 
     // Input: hidden states [n_embd, n_tokens]
+    // NOTE: The DFlash draft model already applies its own final RMSNorm,
+    // so we skip the target's out_norm and go directly to lm_head.
     ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w.n_embd, n_tokens);
     ggml_set_input(inp);
 
-    // out_norm + lm_head
-    ggml_tensor * cur = gemma4_rms_norm_mul(ctx, inp, w.out_norm, w.norm_eps);
-    cur = ggml_mul_mat(ctx, w.output, cur);  // [n_vocab, n_tokens]
+    // lm_head (skip out_norm — draft already normalized)
+    ggml_tensor * cur = ggml_mul_mat(ctx, w.output, inp);  // [n_vocab, n_tokens]
 
     // Logit softcapping
     if (w.final_logit_softcap > 0.0f) {
